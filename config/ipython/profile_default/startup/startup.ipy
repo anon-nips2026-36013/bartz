@@ -1,0 +1,37 @@
+def _pre_startup():
+    with open(__file__) as f:
+        print("Startup commands:")
+        begin = False
+        for i, line in enumerate(f):
+            line = line.rstrip('\n')
+            if line == "##### BEGIN #####":
+                begin = True
+            elif begin:
+                print(f">>> {line}")
+        print()
+
+_pre_startup()
+
+##### BEGIN #####
+%matplotlib
+%load_ext autoreload
+%autoreload 2
+%load_ext snakeviz
+
+import appnope
+appnope.nope()
+
+from functools import partial
+
+import jax
+jax.config.update('jax_num_cpu_devices', 8)
+
+from jax import jit, vmap, make_mesh, lax, shard_map
+from jax.sharding import NamedSharding, PartitionSpec
+from jax import numpy as jnp
+
+import numpy as np
+import equinox as eqx
+import jaxtyping as jt
+
+import bartz

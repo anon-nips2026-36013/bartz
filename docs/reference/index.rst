@@ -1,0 +1,84 @@
+.. bartz/docs/reference/index.rst
+..
+.. Copyright (c) 2024-2026, The Bartz Contributors
+..
+.. This file is part of bartz.
+..
+.. Permission is hereby granted, free of charge, to any person obtaining a copy
+.. of this software and associated documentation files (the "Software"), to deal
+.. in the Software without restriction, including without limitation the rights
+.. to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+.. copies of the Software, and to permit persons to whom the Software is
+.. furnished to do so, subject to the following conditions:
+..
+.. The above copyright notice and this permission notice shall be included in all
+.. copies or substantial portions of the Software.
+..
+.. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+.. IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+.. FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+.. AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+.. LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+.. OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+.. SOFTWARE.
+
+Reference
+=========
+
+API reference for bartz. Each module page lists its public objects in summary
+tables organized by topic; follow a link for the dedicated page of an object.
+
+High-level interface
+--------------------
+
+.. autosummary::
+    :toctree: _autogen/top
+
+    bartz.Bart
+    bartz.SparseConfig
+    bartz.PredictKind
+    bartz.DataFrame
+    bartz.Series
+
+.. `OutcomeType` is re-exported at the top level, but its page is canonically
+.. under `bartz.mcmcstep`, so link it without generating a duplicate page.
+
+.. autosummary::
+
+    ~bartz.mcmcstep.OutcomeType
+
+R BART3-compatible interface
+----------------------------
+
+.. autosummary::
+    :toctree: _autogen/mod
+
+    bartz.BART
+
+stochtree-compatible interface
+------------------------------
+
+.. autosummary::
+    :toctree: _autogen/mod
+
+    bartz.stochtree
+
+MCMC and trees
+--------------
+
+.. autosummary::
+    :toctree: _autogen/mod
+
+    bartz.mcmcstep
+    bartz.mcmcloop
+    bartz.grove
+    bartz.prepcovars
+
+Debugging and testing
+---------------------
+
+.. autosummary::
+    :toctree: _autogen/mod
+
+    bartz.debug
+    bartz.testing

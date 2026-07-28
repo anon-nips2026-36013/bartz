@@ -1,0 +1,686 @@
+# bartz/src/bartz/BART/_gbart.py
+#
+# Copyright (c) 2024-2026, The Bartz Contributors
+#
+# This file is part of bartz.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Implement classes `mc_gbart` and `gbart` that mimic the R BART3 package."""
+
+from collections.abc import Mapping
+from functools import cached_property, partial
+from types import MappingProxyType
+from typing import Any, Literal
+
+import jax.numpy as jnp
+from equinox import Module, field
+from jax.scipy.special import ndtr
+from jaxtyping import Array, Float, Float32, Int32, Key, Real, Shaped
+
+from bartz._interface import (
+    ArrayLike,
+    Bart,
+    DataFrame,
+    FloatLike,
+    PredictKind,
+    Series,
+    SparseConfig,
+    _process_predictor_input,
+    _process_response_input,
+)
+from bartz._jaxext.scipy.stats import invgamma
+from bartz.mcmcloop import BurninTrace, MainTrace
+from bartz.mcmcstep._axes import chain_to_axis, chain_vmap_axes
+from bartz.mcmcstep._state import State
+from bartz.prepcovars import GivenSplitsBinner, RangeEvenBinner, UniqueQuantileBinner
+from bartz.prepcovars._prepcovars import _sigma2_from_ols
+
+
+class mc_gbart(Module):
+    R"""
+    Nonparametric regression with Bayesian Additive Regression Trees (BART).
+
+    Regress `y_train` on `x_train` with a latent mean function represented as
+    a sum of decision trees [2]_. The inference is carried out by sampling the
+    posterior distribution of the tree ensemble with an MCMC.
+
+    Parameters
+    ----------
+    x_train
+        The training predictors.
+    y_train
+        The training responses.
+    x_test
+        The test predictors.
+    type
+        The type of regression. 'wbart' for continuous regression, 'pbart' for
+        binary regression with probit link.
+    sparse
+        Whether to activate variable selection on the predictors as done in
+        [1]_.
+    theta
+    a
+    b
+    rho
+        Hyperparameters of the sparsity prior used for variable selection.
+
+        The prior distribution on the choice of predictor for each decision rule
+        is
+
+        .. math::
+            (s_1, \ldots, s_p) \sim
+            \operatorname{Dirichlet}(\mathtt{theta}/p, \ldots, \mathtt{theta}/p).
+
+        If `theta` is not specified, it's a priori distributed according to
+
+        .. math::
+            \frac{\mathtt{theta}}{\mathtt{theta} + \mathtt{rho}} \sim
+            \operatorname{Beta}(\mathtt{a}, \mathtt{b}).
+
+        If not specified, `rho` is set to the number of predictors p. To tune
+        the prior, consider setting a lower `rho` to prefer more sparsity.
+        If setting `theta` directly, it should be in the ballpark of p or lower
+        as well.
+    augment
+        Whether to account exactly for the decision rules forbidden by the
+        ancestors of each node when updating the variable selection
+        probabilities, using data augmentation. Only relevant if ``sparse=True``.
+        Like the ``augment`` option of R BART3, but sampling the exact full
+        conditional rather than substituting expected counts.
+    varprob
+        The probability distribution over the `p` predictors for choosing a
+        predictor to split on in a decision node a priori. Must be > 0. It does
+        not need to be normalized to sum to 1. If not specified, use a uniform
+        distribution. If ``sparse=True``, this is used as initial value for the
+        MCMC.
+    xinfo
+        A matrix with the cutpoins to use to bin each predictor. If not
+        specified, it is generated automatically according to `usequants` and
+        `numcut`.
+
+        Each row shall contain a sorted list of cutpoints for a predictor. If
+        there are less cutpoints than the number of columns in the matrix,
+        fill the remaining cells with NaN.
+
+        `xinfo` shall be a matrix even if `x_train` is a dataframe.
+    usequants
+        Whether to use predictors quantiles instead of a uniform grid to bin
+        predictors. Ignored if `xinfo` is specified.
+    rm_const
+        How to treat predictors with no associated decision rules (i.e., there
+        are no available cutpoints for that predictor). If `True` (default),
+        they are ignored. If `False`, an error is raised if there are any.
+    sigest
+        An estimate of the residual standard deviation on `y_train`, used to set
+        `lambda_`. If not specified, it is estimated by linear regression (with
+        intercept, and without taking into account `w`). Ignored if `lambda_` is
+        specified.
+    sigdf
+        The degrees of freedom of the scaled inverse-chisquared prior on the
+        noise variance.
+    sigquant
+        The quantile of the prior on the noise variance that shall match
+        `sigest` to set the scale of the prior. Ignored if `lambda_` is specified.
+    k
+        The inverse scale of the prior standard deviation on the latent mean
+        function, relative to half the observed range of `y_train`. If `y_train`
+        has less than two elements, `k` is ignored and the scale is set to 1.
+    power
+    base
+        Parameters of the prior on tree node generation. The probability that a
+        node at depth `d` (0-based) is non-terminal is ``base / (1 + d) **
+        power``.
+    lambda_
+        The prior harmonic mean of the error variance. (The harmonic mean of x
+        is 1/mean(1/x).) If not specified, it is set based on `sigest` and
+        `sigquant`.
+    tau_num
+        The numerator in the expression that determines the prior standard
+        deviation of leaves. If not specified, default to ``(max(y_train) -
+        min(y_train)) / 2`` (or 1 if `y_train` has less than two elements) for
+        continuous regression, and 3 for binary regression.
+    offset
+        The prior mean of the latent mean function. If not specified, it is set
+        to the mean of `y_train` for continuous regression, and to
+        ``Phi^-1(mean(y_train))`` for binary regression. If `y_train` is empty,
+        `offset` is set to 0. With binary regression, if `y_train` is all
+        `False` or `True`, it is set to ``Phi^-1(1/(n+1))`` or
+        ``Phi^-1(n/(n+1))``, respectively.
+    w
+        Coefficients that rescale the error standard deviation on each
+        datapoint. Not specifying `w` is equivalent to setting it to 1 for all
+        datapoints. Note: `w` is ignored in the automatic determination of
+        `sigest`, so either the weights should be O(1), or `sigest` should be
+        specified by the user. Not supported with binary regression
+        (``type='pbart'``).
+    ntree
+        The number of trees used to represent the latent mean function. By
+        default 200 for continuous regression and 50 for binary regression.
+    numcut
+        If `usequants` is `False`: the exact number of cutpoints used to bin the
+        predictors, ranging between the minimum and maximum observed values
+        (excluded).
+
+        If `usequants` is `True`: the maximum number of cutpoints to use for
+        binning the predictors. Each predictor is binned such that its
+        distribution in `x_train` is approximately uniform across bins. The
+        number of bins is at most the number of unique values appearing in
+        `x_train`, or ``numcut + 1``.
+
+        Before running the algorithm, the predictors are compressed to the
+        smallest integer type that fits the bin indices, so `numcut` is best set
+        to the maximum value of an unsigned integer type, like 255.
+
+        Ignored if `xinfo` is specified.
+    ndpost
+        The number of MCMC samples to save, after burn-in. `ndpost` is the
+        total number of samples across all chains. `ndpost` is rounded up to the
+        first multiple of `mc_cores`.
+    nskip
+        The number of initial MCMC samples to discard as burn-in. This number
+        of samples is discarded from each chain.
+    keepevery
+        The thinning factor for the MCMC samples, after burn-in. By default, 1
+        for continuous regression and 10 for binary regression.
+    printevery
+        The number of iterations (including thinned-away ones) between each log
+        line. Set to `None` to disable logging. ^C interrupts the MCMC only
+        every `printevery` iterations, so with logging disabled it's impossible
+        to kill the MCMC conveniently.
+    mc_cores
+        The number of independent MCMC chains.
+    seed
+        The seed for the random number generator.
+    bart_kwargs
+        Additional arguments passed to `bartz.Bart`.
+
+    Raises
+    ------
+    ValueError
+        If `w` is set with binary regression (``type='pbart'``).
+
+    Notes
+    -----
+    This interface imitates the function ``mc_gbart`` from the R package `BART3
+    <https://github.com/rsparapa/bnptools>`_, but with these differences:
+
+    - If ``usequants=False``, R BART3 switches to quantiles anyway if there are
+      less predictor values than the required number of bins, while bartz
+      always follows the specification.
+    - Some functionality is missing.
+    - The error variance parameter is called `lambda_` instead of `lambda`,
+      since the latter is a reserved word in Python.
+    - There are some additional attributes, and some missing.
+    - The trees have a maximum depth of 6.
+    - `rm_const` refers to predictors without decision rules instead of
+      predictors that are constant in `x_train`.
+    - If `rm_const=True` and some variables are dropped, the predictors
+      matrix/dataframe passed to `predict` should still include them.
+
+    References
+    ----------
+    .. [1] Linero, Antonio R. (2018). "Bayesian Regression Trees for
+       High-Dimensional Prediction and Variable Selection". In: Journal of the
+       American Statistical Association 113.522, pp. 626-636.
+    .. [2] Hugh A. Chipman, Edward I. George, Robert E. McCulloch "BART:
+       Bayesian additive regression trees," The Annals of Applied Statistics,
+       Ann. Appl. Stat. 4(1), 266-298, (March 2010).
+    """
+
+    _bart: Bart
+    _x_train_fmt: Any = field(static=True, default=None)
+    _yhat_test: Float32[Array, 'ndpost m'] | None = None
+
+    sigest: Float32[Array, ''] | None = None
+    """The estimated standard deviation of the error used to set `lambda_`."""
+
+    def __init__(
+        self,
+        x_train: Real[ArrayLike, 'n p'] | DataFrame,
+        y_train: Float32[ArrayLike, ' n'] | Series,
+        *,
+        x_test: Real[ArrayLike, 'm p'] | DataFrame | None = None,
+        type: Literal['wbart', 'pbart'] = 'wbart',  # noqa: A002
+        sparse: bool = False,
+        theta: FloatLike | None = None,
+        a: FloatLike = 0.5,
+        b: FloatLike = 1.0,
+        rho: FloatLike | None = None,
+        augment: bool = False,
+        varprob: Float[ArrayLike, ' p'] | None = None,
+        xinfo: Float[ArrayLike, 'p ncut'] | None = None,
+        usequants: bool = False,
+        rm_const: bool = True,
+        sigest: FloatLike | None = None,
+        sigdf: FloatLike = 3.0,
+        sigquant: FloatLike = 0.9,
+        k: FloatLike = 2.0,
+        power: FloatLike = 2.0,
+        base: FloatLike = 0.95,
+        lambda_: FloatLike | None = None,
+        tau_num: FloatLike | None = None,
+        offset: FloatLike | None = None,
+        w: Float[ArrayLike, ' n'] | Series | None = None,
+        ntree: int | None = None,
+        numcut: int = 100,
+        ndpost: int = 1000,
+        nskip: int = 100,
+        keepevery: int | None = None,
+        printevery: int | None = 100,
+        mc_cores: int = 2,
+        seed: int | Key[Array, ''] = 0,
+        bart_kwargs: Mapping = MappingProxyType({}),
+    ) -> None:
+        # BART3 does not support heteroskedastic probit
+        if type == 'pbart' and w is not None:
+            msg = (
+                "w is not supported with binary regression (type='pbart');"
+                ' BART3 has no heteroskedastic probit.'
+            )
+            raise ValueError(msg)
+
+        # set defaults that depend on type of regression
+        if keepevery is None:
+            keepevery = 10 if type == 'pbart' else 1
+        if ntree is None:
+            ntree = 50 if type == 'pbart' else 200
+
+        # pre-process the data to numeric arrays once, so the OLS estimate of
+        # `sigest` and `Bart` share a single copy of the (memory-heavy) X matrix.
+        # `Bart` records the format as plain arrays, so `predict` re-implements
+        # the input-format consistency check against the original format here.
+        x_train, self._x_train_fmt = _process_bart3_predictor_input(x_train)
+        y_train = _process_response_input(y_train)
+
+        # map the BART3 error-variance settings to Bart's sigma prior, estimating
+        # `sigest` by linear regression on x_train when needed
+        sigma_kw, self.sigest = _resolve_sigma_prior(
+            x_train,
+            y_train,
+            type=type,
+            sigest=sigest,
+            sigdf=sigdf,
+            sigquant=sigquant,
+            lambda_=lambda_,
+        )
+
+        # convert to per-chain n_save for Bart
+        num_chains = None if mc_cores == 1 else mc_cores
+        actual_num_chains = num_chains or 1
+        n_save = ndpost // actual_num_chains + bool(ndpost % actual_num_chains)
+
+        # translate xinfo/usequants/numcut to a binner factory
+        if xinfo is not None:
+            binner = partial(GivenSplitsBinner, xinfo=jnp.asarray(xinfo))
+        elif usequants:
+            binner = partial(
+                UniqueQuantileBinner, max_bins=numcut + 1, max_subsample=None
+            )
+        else:
+            binner = partial(RangeEvenBinner, max_bins=numcut + 1)
+
+        # set most calling arguments for Bart
+        kwargs: dict = dict(
+            x_train=x_train,
+            y_train=y_train,
+            outcome_type=dict(wbart='continuous', pbart='binary')[type],
+            sparse=SparseConfig(
+                enabled=sparse, theta=theta, a=a, b=b, rho=rho, augment=augment
+            ),
+            varprob=varprob,
+            binner=binner,
+            rm_const=rm_const,
+            **sigma_kw,
+            k=k,
+            power=power,
+            base=base,
+            tau_num=tau_num,
+            offset=offset,
+            error_scale=w,
+            num_trees=ntree,
+            n_save=n_save,
+            n_burn=nskip,
+            n_skip=keepevery,
+            printevery=printevery,
+            seed=seed,
+            maxdepth=6,
+            num_chains=num_chains,
+            precompute_predict_train=True,
+        )
+
+        # default min_points_per_leaf to 5 (unless set by the user) to match
+        # BART3's hard-coded nl>=5 && nr>=5 birth check.
+        # min_points_per_decision_node keeps the Bart default of 10
+        # (= 2 * min_points_per_leaf): it makes the proposal efficient by not
+        # trying to grow leaves too small to split, without changing the target
+        # posterior, which thus matches BART3.
+        if 'min_points_per_leaf' not in bart_kwargs.get('init_kw', {}):
+            bart_kwargs = dict(
+                bart_kwargs,
+                init_kw=dict(bart_kwargs.get('init_kw', {}), min_points_per_leaf=5),
+            )
+
+        # add user arguments
+        kwargs.update(bart_kwargs)
+
+        # invoke Bart
+        self._bart = Bart(**kwargs)
+
+        # predict at test points
+        if x_test is not None:
+            self._yhat_test = self.predict(x_test)
+
+    # Public attributes from Bart
+
+    @property
+    def ndpost(self) -> int:
+        """The number of MCMC samples saved, after burn-in."""
+        return self._bart.ndpost
+
+    @property
+    def offset(self) -> Float32[Array, '']:
+        """The prior mean of the latent mean function."""
+        return self._bart.offset
+
+    # Private attributes from Bart
+
+    @property
+    def _main_trace(self) -> MainTrace:
+        return self._bart._main_trace  # noqa: SLF001
+
+    @property
+    def _burnin_trace(self) -> BurninTrace:
+        return self._bart._burnin_trace  # noqa: SLF001
+
+    @property
+    def _mcmc_state(self) -> State:
+        return self._bart._mcmc_state  # noqa: SLF001
+
+    @property
+    def _splits(self) -> Real[Array, 'p max_num_splits']:
+        return self._bart._binner._splits  # noqa: SLF001
+
+    # Properties
+
+    @property
+    def yhat_test(self) -> Float32[Array, 'ndpost m'] | None:
+        """The conditional posterior mean at `x_test` for each MCMC iteration."""
+        return self._yhat_test
+
+    @cached_property
+    def accept(
+        self,
+    ) -> (
+        Float32[Array, ' nskip_plus_ndpost']
+        | Float32[Array, 'nskip_plus_ndpost_per_core mc_cores']
+    ):
+        """The fraction of trees with an accepted move, including burn-in samples.
+
+        Unlike BART3, the iterations thinned away by `keepevery` are not
+        recorded.
+        """
+        # `Bart.accept` is (mc_cores, samples) or (samples,); the public layout
+        # is (samples, mc_cores), like `sigma`
+        return self._bart.accept.T
+
+    @cached_property
+    def prob_test(self) -> Float32[Array, 'ndpost m'] | None:
+        """The posterior probability of y being True at `x_test` for each MCMC iteration."""
+        if self._yhat_test is None or self._mcmc_state.z is None:
+            return None
+        return ndtr(self._yhat_test)
+
+    @cached_property
+    def prob_test_mean(self) -> Float32[Array, ' m'] | None:
+        """The marginal posterior probability of y being True at `x_test`."""
+        if self.prob_test is None:
+            return None
+        return self.prob_test.mean(axis=0)
+
+    @cached_property
+    def prob_train(self) -> Float32[Array, 'ndpost n'] | None:
+        """The posterior probability of y being True at `x_train` for each MCMC iteration."""
+        if self._mcmc_state.z is not None:
+            return ndtr(self.yhat_train)
+        else:
+            return None
+
+    @cached_property
+    def prob_train_mean(self) -> Float32[Array, ' n'] | None:
+        """The marginal posterior probability of y being True at `x_train`."""
+        if self.prob_train is None:
+            return None
+        else:
+            return self.prob_train.mean(axis=0)
+
+    @cached_property
+    def sigma(
+        self,
+    ) -> (
+        Float32[Array, ' nskip_plus_ndpost']
+        | Float32[Array, 'nskip_plus_ndpost_per_core mc_cores']
+        | None
+    ):
+        """The standard deviation of the error, including burn-in samples."""
+        if self._mcmc_state.z is not None:
+            return None
+        assert self._burnin_trace.error_cov_inv.ndim <= 2  # chains and samples
+        tc = chain_vmap_axes(self._main_trace).error_cov_inv
+
+        def arrange(arr: Shaped[Array, '...']) -> Shaped[Array, '...']:
+            # Public output is (nskip+ndpost, mc_cores) = (samples, chains).
+            return chain_to_axis(arr, tc, target=-1)
+
+        return jnp.sqrt(
+            jnp.reciprocal(
+                jnp.concatenate(
+                    [
+                        arrange(self._burnin_trace.error_cov_inv),
+                        arrange(self._main_trace.error_cov_inv),
+                    ],
+                    axis=0,
+                )
+            )
+        )
+
+    @cached_property
+    def sigma_(self) -> Float32[Array, 'ndpost'] | None:
+        """The standard deviation of the error, only over the post-burnin samples and flattened."""
+        if self._mcmc_state.z is not None:
+            return None
+        assert self._main_trace.error_cov_inv.ndim <= 2  # chains and samples
+        arr = chain_to_axis(
+            self._main_trace.error_cov_inv,
+            chain_vmap_axes(self._main_trace).error_cov_inv,
+        )
+        return jnp.sqrt(jnp.reciprocal(arr)).reshape(-1)
+
+    @cached_property
+    def sigma_mean(self) -> Float32[Array, ''] | None:
+        """The mean of `sigma`, only over the post-burnin samples."""
+        if self.sigma_ is None:
+            return None
+        return self.sigma_.mean()
+
+    @cached_property
+    def varcount(self) -> Int32[Array, 'ndpost p']:
+        """Histogram of predictor usage for decision rules in the trees."""
+        return self._bart.varcount
+
+    @cached_property
+    def varcount_mean(self) -> Float32[Array, ' p']:
+        """Average of `varcount` across MCMC iterations."""
+        return self._bart.varcount_mean
+
+    @cached_property
+    def varprob(self) -> Float32[Array, 'ndpost p']:
+        """Posterior samples of the probability of choosing each predictor for a decision rule."""
+        return self._bart.varprob
+
+    @cached_property
+    def varprob_mean(self) -> Float32[Array, ' p']:
+        """The marginal posterior probability of each predictor being chosen for a decision rule."""
+        return self._bart.varprob_mean
+
+    @cached_property
+    def yhat_test_mean(self) -> Float32[Array, ' m'] | None:
+        """The marginal posterior mean at `x_test`.
+
+        Not defined with binary regression because it's error-prone, typically
+        the right thing to consider would be `prob_test_mean`.
+        """
+        if self._yhat_test is None or self._mcmc_state.z is not None:
+            return None
+        return self._yhat_test.mean(axis=0)
+
+    @cached_property
+    def yhat_train(self) -> Float32[Array, 'ndpost n']:
+        """The conditional posterior mean at `x_train` for each MCMC iteration."""
+        return self._bart.predict('train', kind=PredictKind.latent_samples)
+
+    @cached_property
+    def yhat_train_mean(self) -> Float32[Array, ' n'] | None:
+        """The marginal posterior mean at `x_train`.
+
+        Not defined with binary regression because it's error-prone, typically
+        the right thing to consider would be `prob_train_mean`.
+        """
+        if self._mcmc_state.z is not None:
+            return None
+        else:
+            return self.yhat_train.mean(axis=0)
+
+    # Public methods from Bart
+
+    def predict(
+        self, x_test: Real[ArrayLike, 'm p'] | DataFrame
+    ) -> Float32[Array, 'ndpost m']:
+        """
+        Evaluate the sum-of-trees at `x_test` for each MCMC iteration.
+
+        Parameters
+        ----------
+        x_test
+            The test predictors.
+
+        Returns
+        -------
+        Posterior samples of the latent function value at `x_test`. In the continuous case, this is the conditional mean.
+
+        Raises
+        ------
+        ValueError
+            If `x_test` has a different format than `x_train`.
+        """
+        # pre-process and check the format matches x_train; Bart only sees plain
+        # arrays, so this consistency check is re-implemented here
+        x_test, x_test_fmt = _process_bart3_predictor_input(x_test)
+        if x_test_fmt != self._x_train_fmt:
+            msg = (
+                f'Input format mismatch: {x_test_fmt=} '
+                f'!= x_train_fmt={self._x_train_fmt!r}'
+            )
+            raise ValueError(msg)
+        return self._bart.predict(x_test, kind=PredictKind.latent_samples)
+
+
+class gbart(mc_gbart):
+    """Subclass of `mc_gbart` that forces `mc_cores=1`."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if 'mc_cores' in kwargs:
+            msg = "gbart.__init__() got an unexpected keyword argument 'mc_cores'"
+            raise TypeError(msg)
+        kwargs.update(mc_cores=1)
+        super().__init__(*args, **kwargs)
+
+
+def _process_bart3_predictor_input(
+    x: Real[ArrayLike, 'n p'] | DataFrame,
+) -> tuple[Shaped[Array, 'p n'], Any]:
+    """Process BART3-style predictors (one predictor per column) to bartz layout.
+
+    Unlike `bartz.Bart`, BART3 lays out predictor matrices with one predictor
+    per column, so plain arrays are transposed to bartz's (p, n) layout.
+    Dataframes already use one column per predictor, so they are left untouched.
+    """
+    if not isinstance(x, DataFrame):
+        x = jnp.asarray(x).T
+    return _process_predictor_input(x)
+
+
+def _resolve_sigma_prior(
+    x_train: Shaped[Array, 'p n'],
+    y_train: Float32[Array, ' n'],
+    *,
+    type: Literal['wbart', 'pbart'],  # noqa: A002
+    sigest: FloatLike | None,
+    sigdf: FloatLike,
+    sigquant: FloatLike,
+    lambda_: FloatLike | None,
+) -> tuple[dict, Float32[Array, ''] | None]:
+    """Map the BART3 error-variance settings to Bart's sigma prior.
+
+    Returns (sigma_kwargs, sigest) where sigest is the error standard deviation
+    estimate, or None for binary regression or when `lambda_` is given.
+    """
+    if type == 'pbart':
+        if sigest is not None or lambda_ is not None:
+            msg = 'Do not set `sigest` or `lambda_` for binary regression, they are ignored'
+            raise ValueError(msg)
+        return {}, None
+
+    if lambda_ is None:
+        if sigest is None:
+            sigest2 = _sigest2_ols(x_train, y_train)
+        else:
+            sigest2 = jnp.square(jnp.asarray(sigest, jnp.float32))
+        sigest_out = jnp.sqrt(sigest2)
+        # lambda_ such that the sigquant quantile of the prior matches sigest²
+        invchi2 = invgamma.ppf(sigquant, sigdf / 2) / 2
+        lambda_ = sigest2 / (invchi2 * sigdf)
+    else:
+        if sigest is not None:
+            msg = "Do not set `sigest` if `lambda_` is specified, it's ignored"
+            raise ValueError(msg)
+        lambda_ = jnp.asarray(lambda_, jnp.float32)
+        sigest_out = None
+
+    # Bart's prior reduces to scaled-inv-χ²(sigma_df, sigma_scale²) on the error
+    # variance, matching BART3's scaled-inv-χ²(sigdf, lambda_); sigma_init keeps
+    # the initial precision at the prior mean nu/rate = 1 / lambda_
+    sigma_scale = jnp.sqrt(lambda_)
+    sigma_kw = dict(sigma_df=sigdf, sigma_scale=sigma_scale, sigma_init=sigma_scale)
+    return sigma_kw, sigest_out
+
+
+def _sigest2_ols(
+    x_train: Shaped[Array, 'p n'], y_train: Float32[Array, ' n']
+) -> Float32[Array, '']:
+    """Estimate the error variance by OLS with intercept."""
+    p, n = x_train.shape
+    if n <= p:
+        msg = (
+            f'cannot estimate `sigest` by OLS with {n} datapoints and {p} '
+            'predictors (it requires more datapoints than predictors); '
+            'specify `sigest` or `lambda_` explicitly'
+        )
+        raise ValueError(msg)
+    return _sigma2_from_ols(x_train, y_train)
